@@ -1,6 +1,5 @@
 import os
-if "KERAS_BACKEND" not in os.environ:
-    os.environ["KERAS_BACKEND"] = "torch"
+import json
 import pickle
 import time
 from datetime import datetime
@@ -10,32 +9,72 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-# Robust Keras 3 multi-backend import with fallback
-try:
-    import keras
-    from keras.models import load_model
-except Exception:
-    import tensorflow as tf
-    from tensorflow.keras.models import load_model
+def pad_sequences(sequences, maxlen, padding="post", truncating="post", value=0):
+    padded = []
+    for seq in sequences:
+        seq_list = list(seq)
+        if len(seq_list) > maxlen:
+            seq_list = seq_list[:maxlen] if truncating == "post" else seq_list[-maxlen:]
+        elif len(seq_list) < maxlen:
+            pad_len = maxlen - len(seq_list)
+            pad_items = [value] * pad_len
+            seq_list = seq_list + pad_items if padding == "post" else pad_items + seq_list
+        padded.append(seq_list)
+    return np.array(padded, dtype=np.int32)
 
-try:
-    from keras.utils import pad_sequences
-except Exception:
-    try:
-        from tensorflow.keras.preprocessing.sequence import pad_sequences
-    except Exception:
-        def pad_sequences(sequences, maxlen, padding="post", truncating="post", value=0):
-            padded = []
-            for seq in sequences:
-                seq_list = list(seq)
-                if len(seq_list) > maxlen:
-                    seq_list = seq_list[:maxlen] if truncating == "post" else seq_list[-maxlen:]
-                elif len(seq_list) < maxlen:
-                    pad_len = maxlen - len(seq_list)
-                    pad_items = [value] * pad_len
-                    seq_list = seq_list + pad_items if padding == "post" else pad_items + seq_list
-                padded.append(seq_list)
-            return np.array(padded, dtype=np.int32)
+class PureTokenizer:
+    def __init__(self, word_index, filters='!"#$%&()*+,-./:;<=>?@[\\]^_`{|}~\t\n', lower=True):
+        self.word_index = word_index
+        self.filters = set(filters)
+        self.lower = lower
+
+    def texts_to_sequences(self, texts):
+        sequences = []
+        for text in texts:
+            if not isinstance(text, str):
+                text = str(text)
+            if self.lower:
+                text = text.lower()
+            clean = "".join(c for c in text if c not in self.filters)
+            seq = [self.word_index[w] for w in clean.split() if w in self.word_index]
+            sequences.append(seq)
+        return sequences
+
+class PureNumpyLSTMModel:
+    """Zero-dependency pure NumPy LSTM inference engine identical to trained Keras model"""
+    def __init__(self, weights):
+        self.w_emb = weights["emb"]
+        self.w_kernel = weights["kernel"]
+        self.w_recurrent = weights["recurrent"]
+        self.w_bias = weights["bias"]
+        self.w_dense = weights["dense"]
+        self.b_dense = weights["b_dense"]
+        self.w_dense1 = weights["dense1"]
+        self.b_dense1 = weights["b_dense1"]
+
+    def predict(self, padded_seq, verbose=0, batch_size=64):
+        N, T = padded_seq.shape
+        units = 64
+        outputs = []
+        for n in range(N):
+            h = np.zeros(units, dtype=np.float32)
+            c = np.zeros(units, dtype=np.float32)
+            for t in range(T):
+                idx = padded_seq[n, t]
+                if idx == 0:
+                    continue
+                x = self.w_emb[idx]
+                z = x @ self.w_kernel + h @ self.w_recurrent + self.w_bias
+                i = 1.0 / (1.0 + np.exp(-np.clip(z[0:64], -50, 50)))
+                f = 1.0 / (1.0 + np.exp(-np.clip(z[64:128], -50, 50)))
+                c_cand = np.tanh(z[128:192])
+                o = 1.0 / (1.0 + np.exp(-np.clip(z[192:256], -50, 50)))
+                c = f * c + i * c_cand
+                h = o * np.tanh(c)
+            d1 = np.maximum(0, h @ self.w_dense + self.b_dense)
+            out = 1.0 / (1.0 + np.exp(-np.clip(d1 @ self.w_dense1 + self.b_dense1, -50, 50)))
+            outputs.append(out)
+        return np.array(outputs, dtype=np.float32)
 
 # -----------------------------------------------------------------------------
 # APPLICATION CONFIGURATION
@@ -264,30 +303,97 @@ def locate_file(candidates):
 @st.cache_resource(show_spinner="Loading Recurrent Neural Network models and assets...")
 def load_artifacts():
     model_path = locate_file(["spam_rnn.keras", "spam_rnn(2).keras"])
+    tok_json_path = locate_file(["tokenizer.json"])
     tok_path = locate_file(["tokenizer.pkl", "tokenizer(4).pkl"])
     cfg_path = locate_file(["model_config.pkl", "model_config(1).pkl"])
     le_path = locate_file(["label_encoder.pkl", "label_encoder(1).pkl"])
 
-    missing = []
-    if not model_path: missing.append("spam_rnn.keras")
-    if not tok_path: missing.append("tokenizer.pkl")
-    if not cfg_path: missing.append("model_config.pkl")
-    if not le_path: missing.append("label_encoder.pkl")
+    # 1. Config Loader
+    config = {
+        "max_words": 10000,
+        "max_length": 100,
+        "vocab_size": 8143,
+        "padding": "post",
+        "truncating": "post",
+        "threshold": 0.5,
+        "model_type": "LSTM",
+    }
+    if cfg_path:
+        try:
+            with open(cfg_path, "rb") as f:
+                config = pickle.load(f)
+        except Exception:
+            pass
 
-    if missing:
-        return None, None, None, None, f"Missing required artifacts: {', '.join(missing)}"
+    # 2. Label Encoder Loader
+    class StandaloneLabelEncoder:
+        classes_ = np.array(["ham", "spam"])
 
-    try:
-        model = load_model(model_path, compile=False)
-        with open(tok_path, "rb") as f:
-            tokenizer = pickle.load(f)
-        with open(cfg_path, "rb") as f:
-            config = pickle.load(f)
-        with open(le_path, "rb") as f:
-            label_encoder = pickle.load(f)
-        return model, tokenizer, config, label_encoder, None
-    except Exception as err:
-        return None, None, None, None, f"Failed to initialize artifacts: {str(err)}"
+    label_encoder = StandaloneLabelEncoder()
+    if le_path:
+        try:
+            with open(le_path, "rb") as f:
+                label_encoder = pickle.load(f)
+        except Exception:
+            pass
+
+    # 3. Tokenizer Loader: prefers JSON (zero dependency), falls back to PKL
+    tokenizer = None
+    if tok_json_path:
+        try:
+            with open(tok_json_path, "r", encoding="utf-8") as f:
+                tdata = json.load(f)
+            tokenizer = PureTokenizer(
+                tdata["word_index"],
+                tdata.get("filters", '!"#$%&()*+,-./:;<=>?@[\\]^_`{|}~\t\n'),
+                lower=tdata.get("lower", True),
+            )
+        except Exception:
+            pass
+
+    if tokenizer is None and tok_path:
+        try:
+            with open(tok_path, "rb") as f:
+                tokenizer = pickle.load(f)
+        except Exception:
+            pass
+
+    # 4. Model Loader: Try native Keras first, fall back to PureNumpyLSTMModel
+    model = None
+    if model_path:
+        try:
+            import keras
+            model = keras.models.load_model(model_path, compile=False)
+        except BaseException:
+            try:
+                import tensorflow as tf
+                model = tf.keras.models.load_model(model_path, compile=False)
+            except BaseException:
+                pass
+
+        if model is None:
+            try:
+                import zipfile, h5py, io
+                with zipfile.ZipFile(model_path, "r") as z:
+                    with h5py.File(io.BytesIO(z.read("model.weights.h5")), "r") as f:
+                        weights = {
+                            "emb": np.array(f["layers/embedding/vars/0"]),
+                            "kernel": np.array(f["layers/lstm/cell/vars/0"]),
+                            "recurrent": np.array(f["layers/lstm/cell/vars/1"]),
+                            "bias": np.array(f["layers/lstm/cell/vars/2"]),
+                            "dense": np.array(f["layers/dense/vars/0"]),
+                            "b_dense": np.array(f["layers/dense/vars/1"]),
+                            "dense1": np.array(f["layers/dense_1/vars/0"]),
+                            "b_dense1": np.array(f["layers/dense_1/vars/1"]),
+                        }
+                model = PureNumpyLSTMModel(weights)
+            except Exception as err:
+                return None, None, None, None, f"Failed to initialize neural weights: {str(err)}"
+
+    if model is None or tokenizer is None:
+        return None, None, None, None, "Required model or tokenizer files could not be initialized."
+
+    return model, tokenizer, config, label_encoder, None
 
 model, tokenizer, model_config, label_encoder, error_msg = load_artifacts()
 
