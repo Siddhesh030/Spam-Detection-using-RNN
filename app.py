@@ -7,8 +7,32 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+# Robust Keras / TensorFlow imports with full backward/forward compatibility
+try:
+    import keras
+    from keras.models import load_model
+except Exception:
+    import tensorflow as tf
+    from tensorflow.keras.models import load_model
+
+try:
+    from keras.utils import pad_sequences
+except Exception:
+    try:
+        from tensorflow.keras.preprocessing.sequence import pad_sequences
+    except Exception:
+        def pad_sequences(sequences, maxlen, padding="post", truncating="post", value=0):
+            padded = []
+            for seq in sequences:
+                seq_list = list(seq)
+                if len(seq_list) > maxlen:
+                    seq_list = seq_list[:maxlen] if truncating == "post" else seq_list[-maxlen:]
+                elif len(seq_list) < maxlen:
+                    pad_len = maxlen - len(seq_list)
+                    pad_items = [value] * pad_len
+                    seq_list = seq_list + pad_items if padding == "post" else pad_items + seq_list
+                padded.append(seq_list)
+            return np.array(padded, dtype=np.int32)
 
 # -----------------------------------------------------------------------------
 # APPLICATION CONFIGURATION
