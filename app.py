@@ -1,4 +1,6 @@
 import os
+if "KERAS_BACKEND" not in os.environ:
+    os.environ["KERAS_BACKEND"] = "torch"
 import pickle
 import time
 from datetime import datetime
@@ -7,7 +9,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-# Robust Keras / TensorFlow imports with full backward/forward compatibility
+
+# Robust Keras 3 multi-backend import with fallback
 try:
     import keras
     from keras.models import load_model
